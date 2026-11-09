@@ -9,6 +9,8 @@ import (
 	"github.com/ethereum/go-ethereum/accounts/abi"
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/core/vm"
+	"github.com/evmos/evmos/v15/precompiles/authorization"
+	"github.com/evmos/evmos/v15/utils"
 )
 
 const (
@@ -26,7 +28,7 @@ const (
 )
 
 // CreateClawbackVestingAccount creates a new clawback vesting account
-func (p Precompile) CreateClawbackVestingAccount(
+func (p *Precompile) CreateClawbackVestingAccount(
 	ctx sdk.Context,
 	origin common.Address,
 	stateDB vm.StateDB,
@@ -38,6 +40,7 @@ func (p Precompile) CreateClawbackVestingAccount(
 		return nil, err
 	}
 
+	// Only EOA can be vesting accounts
 	// Check if the origin matches the vesting address
 	if origin != vestingAddr {
 		return nil, fmt.Errorf(ErrDifferentFromOrigin, origin, vestingAddr)
@@ -62,8 +65,9 @@ func (p Precompile) CreateClawbackVestingAccount(
 }
 
 // FundVestingAccount funds a vesting account by creating vesting schedules
-func (p Precompile) FundVestingAccount(
+func (p *Precompile) FundVestingAccount(
 	ctx sdk.Context,
+	contract *vm.Contract,
 	origin common.Address,
 	stateDB vm.StateDB,
 	method *abi.Method,
@@ -74,8 +78,12 @@ func (p Precompile) FundVestingAccount(
 		return nil, err
 	}
 
-	// Check if the origin matches the funders address
-	if origin != funderAddr {
+	isContractCaller := contract.CallerAddress != origin
+
+	// funder can only be the origin or the contract.Caller
+	isContractFunder := contract.CallerAddress == funderAddr && isContractCaller
+
+	if !isContractFunder && origin != funderAddr {
 		return nil, fmt.Errorf(ErrDifferentFromOrigin, origin, funderAddr)
 	}
 
@@ -88,9 +96,40 @@ func (p Precompile) FundVestingAccount(
 		),
 	)
 
+	// in case the contract is the funder
+	// don't check for auth.
+	// The smart contract (funder) should handle who is authorized to make this call
+	if isContractCaller && !isContractFunder {
+		// if calling from a contract and the contract is not the funder (origin == funderAddr)
+		// check that an authorization exists
+		_, _, err := authorization.CheckAuthzExists(ctx, p.AuthzKeeper, contract.CallerAddress, funderAddr, FundVestingAccountMsgURL)
+		if err != nil {
+			return nil, fmt.Errorf(authorization.ErrAuthzDoesNotExistOrExpired, FundVestingAccountMsgURL, contract.CallerAddress)
+		}
+	}
+
+	if isContractCaller {
+		// Load both accounts before the bank transfer, including a new destination.
+		stateDB.AddBalance(funderAddr, common.Big0)
+		stateDB.AddBalance(vestingAddr, common.Big0)
+	}
+
 	_, err = p.vestingKeeper.FundVestingAccount(sdk.WrapSDKContext(ctx), msg)
 	if err != nil {
 		return nil, err
+	}
+
+	if isContractCaller {
+		vestingCoins := msg.VestingPeriods.TotalAmount()
+		lockedUpCoins := msg.LockupPeriods.TotalAmount()
+		if vestingCoins.IsZero() && lockedUpCoins.IsAllPositive() {
+			vestingCoins = lockedUpCoins
+		}
+
+		// NOTE: This ensures that the changes in the bank keeper are correctly mirrored to the EVM stateDB.
+		amt := vestingCoins.AmountOf(utils.BaseDenom).BigInt()
+		stateDB.SubBalance(funderAddr, amt)
+		stateDB.AddBalance(vestingAddr, amt)
 	}
 
 	if err = p.EmitFundVestingAccountEvent(ctx, stateDB, msg, funderAddr, vestingAddr, lockupPeriods, vestingPeriods); err != nil {
@@ -101,8 +140,9 @@ func (p Precompile) FundVestingAccount(
 }
 
 // Clawback clawbacks tokens from a clawback vesting account
-func (p Precompile) Clawback(
+func (p *Precompile) Clawback(
 	ctx sdk.Context,
+	contract *vm.Contract,
 	origin common.Address,
 	stateDB vm.StateDB,
 	method *abi.Method,
@@ -113,8 +153,13 @@ func (p Precompile) Clawback(
 		return nil, err
 	}
 
-	// Check if the funder matches the origin
-	if origin != funderAddr {
+	isContractCaller := contract.CallerAddress != origin
+
+	// funder can only be the origin or the contract.Caller
+	isContractFunder := contract.CallerAddress == funderAddr && isContractCaller
+
+	// if caller address is origin, the funder MUST match the origin
+	if !isContractFunder && origin != funderAddr {
 		return nil, fmt.Errorf(ErrDifferentFunderOrigin, origin, funderAddr)
 	}
 
@@ -127,9 +172,35 @@ func (p Precompile) Clawback(
 		),
 	)
 
+	// in case the contract is the funder
+	// don't check for auth.
+	// The smart contract (funder) should handle who is authorized to make this call
+	if isContractCaller && !isContractFunder {
+		// if calling from a contract and the contract is not the funder (origin == funderAddr)
+		// check that an authorization exists.
+		_, _, err := authorization.CheckAuthzExists(ctx, p.AuthzKeeper, contract.CallerAddress, funderAddr, ClawbackMsgURL)
+		if err != nil {
+			return nil, fmt.Errorf(authorization.ErrAuthzDoesNotExistOrExpired, ClawbackMsgURL, contract.CallerAddress)
+		}
+	}
+
+	if isContractCaller {
+		// Load both accounts before the bank transfer, including a new destination.
+		stateDB.AddBalance(accountAddr, common.Big0)
+		stateDB.AddBalance(destAddr, common.Big0)
+	}
+
 	response, err := p.vestingKeeper.Clawback(sdk.WrapSDKContext(ctx), msg)
 	if err != nil {
 		return nil, err
+	}
+
+	if isContractCaller {
+		// NOTE: This ensures that the changes in the bank keeper are correctly mirrored to the EVM stateDB when calling
+		// the precompile from another contract.
+		clawbackAmt := response.Coins.AmountOf(utils.BaseDenom).BigInt()
+		stateDB.SubBalance(accountAddr, clawbackAmt)
+		stateDB.AddBalance(destAddr, clawbackAmt)
 	}
 
 	if err = p.EmitClawbackEvent(ctx, stateDB, funderAddr, accountAddr, destAddr); err != nil {
@@ -142,8 +213,9 @@ func (p Precompile) Clawback(
 }
 
 // UpdateVestingFunder updates the vesting funder of a clawback vesting account
-func (p Precompile) UpdateVestingFunder(
+func (p *Precompile) UpdateVestingFunder(
 	ctx sdk.Context,
+	contract *vm.Contract,
 	origin common.Address,
 	stateDB vm.StateDB,
 	method *abi.Method,
@@ -154,8 +226,11 @@ func (p Precompile) UpdateVestingFunder(
 		return nil, err
 	}
 
-	// Check if the origin matches the funder address
-	if origin != funderAddr {
+	isContractCall := contract.CallerAddress != origin
+	isContractFunder := contract.CallerAddress == funderAddr && isContractCall
+	// only the funder can update the funder
+	// if caller address is origin, the funder MUST match the origin
+	if !isContractFunder && origin != funderAddr {
 		return nil, fmt.Errorf(ErrDifferentFunderOrigin, origin, funderAddr)
 	}
 
@@ -167,6 +242,18 @@ func (p Precompile) UpdateVestingFunder(
 			msg.FunderAddress, msg.NewFunderAddress, msg.VestingAddress,
 		),
 	)
+
+	// in case the contract is the funder
+	// don't check for auth.
+	// The smart contract (funder) should handle who is authorized to make this call
+	if isContractCall && !isContractFunder {
+		// if calling from a contract and the contract is not the funder (origin == funderAddr)
+		// check that an authorization exists
+		_, _, err := authorization.CheckAuthzExists(ctx, p.AuthzKeeper, contract.CallerAddress, funderAddr, UpdateVestingFunderMsgURL)
+		if err != nil {
+			return nil, fmt.Errorf(authorization.ErrAuthzDoesNotExistOrExpired, UpdateVestingFunderMsgURL, contract.CallerAddress)
+		}
+	}
 
 	_, err = p.vestingKeeper.UpdateVestingFunder(sdk.WrapSDKContext(ctx), msg)
 	if err != nil {
@@ -181,7 +268,7 @@ func (p Precompile) UpdateVestingFunder(
 }
 
 // ConvertVestingAccount converts a clawback vesting account to a base account once the vesting period is over.
-func (p Precompile) ConvertVestingAccount(
+func (p *Precompile) ConvertVestingAccount(
 	ctx sdk.Context,
 	stateDB vm.StateDB,
 	method *abi.Method,
